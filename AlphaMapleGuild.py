@@ -68,6 +68,9 @@ while True:
 
     # mission_score is one of (0, 1, 2, 3, 4, 5). But same detecting method applied.
     mission_scores = np.zeros(17, dtype=int)
+    detect_and_update(mission_scores, 271, 10)
+    detect_and_update(mission_scores, 277, 1)
+
     detect_and_update(mission_scores, 274)
 
     # flag_score is 1,000 or XX0
@@ -78,20 +81,46 @@ while True:
 
     canal_scores = np.zeros(17, dtype=int)
 
-    detect_and_update(canal_scores, 325, 10000)
-    detect_and_update(canal_scores, 331, 1000)
-    detect_and_update(canal_scores, 340, 100)
-    detect_and_update(canal_scores, 346, 10)
-    detect_and_update(canal_scores, 352, 1)
-
-    detect_and_update(canal_scores, 328, 1000)
-    detect_and_update(canal_scores, 337, 100)
-    detect_and_update(canal_scores, 343, 10)
-    detect_and_update(canal_scores, 349, 1)
-
-    detect_and_update(canal_scores, 332, 100)
-    detect_and_update(canal_scores, 338, 10)
-    detect_and_update(canal_scores, 333, 1)
+    # Process each row independently
+    for row_idx in range(17):
+        # Check starting positions for different digit lengths
+        start_positions = [322, 325, 328, 332]  # 6-digit, 5-digit, 4-digit, 3-digit starting positions
+        
+        # Find first digit position for this specific row
+        first_pos = None
+        first_val = None
+        for pos in start_positions:
+            idx, val = np.where(
+                np.all(capture[row_idx*24:(row_idx+1)*24, pos:pos + 5].reshape(1, 24, -1)[np.newaxis, :, 9:17] == 
+                    NUMBERS[:, np.newaxis, ...], axis=(2, 3)).T)
+            if len(val) > 0:
+                first_pos = pos
+                first_val = val[0]
+                break
+        
+        if first_pos is not None:
+            # Determine digit positions based on first digit position
+            if first_pos == 322:    # 6-digit number
+                digit_positions = [(322, 100000), (328, 10000), (334, 1000), 
+                                (343, 100), (349, 10), (355, 1)]
+            elif first_pos == 325:  # 5-digit number
+                digit_positions = [(325, 10000), (331, 1000), (340, 100), 
+                                (346, 10), (352, 1)]
+            elif first_pos == 328:  # 4-digit number
+                digit_positions = [(328, 1000), (337, 100), (343, 10), (349, 1)]
+            else:                   # 3-digit number
+                digit_positions = [(332, 100), (338, 10), (344, 1)]
+            
+            # Process all digits for this row
+            score = 0
+            for pos, multiplier in digit_positions:
+                idx, val = np.where(
+                    np.all(capture[row_idx*24:(row_idx+1)*24, pos:pos + 5].reshape(1, 24, -1)[np.newaxis, :, 9:17] == 
+                        NUMBERS[:, np.newaxis, ...], axis=(2, 3)).T)
+                if len(val) > 0:
+                    score += val[0] * multiplier
+            
+            canal_scores[row_idx] = score
 
     nickname_images = capture[:, 6:76].reshape(17, 24, -1)[:, 7:20]
 
