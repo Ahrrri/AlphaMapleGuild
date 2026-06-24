@@ -4,3 +4,4 @@ build
 *.spec
 nicknames
 result.xlsx
+test_images
