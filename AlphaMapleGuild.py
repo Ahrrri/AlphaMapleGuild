@@ -3,7 +3,6 @@ import cv2
 import numpy as np
 from openpyxl import Workbook, load_workbook
 from openpyxl.drawing.image import Image
-import time
 from PIL import ImageGrab
 import os
 import hashlib
@@ -75,10 +74,9 @@ CANAL_LAYOUTS = {                                # 자리수별 [(x, 배수), ..
 # 포함되므로, 다른 탭이면 매칭 오차가 올라가 창 탐색 단계에서 자동으로 걸러진다.
 
 # --- 스캔 동작 ---------------------------------------------------------------
-POLL_INTERVAL   = 0.50   # 연속 캡처 간격(초). 부드러운 스크롤을 프레임으로 훑음
-IDLE_TIMEOUT    = 10     # 신규 행이 이 시간(초) 동안 없으면 스캔 종료
+# Enter 구동: 사용자가 정지된 화면에서 Enter 를 누를 때만 캡처하므로
+# 연속 캡처용 파라미터(POLL/IDLE/CONFIRM)는 불필요.
 BLANK_MIN_PIXELS = 3     # 닉네임 영역 텍스트 픽셀이 이 이하이면 빈 행으로 간주
-CONFIRM_FRAMES  = 2      # 같은 해시가 N프레임 연속 관측돼야 확정(커서 가림/모션 방어)
 
 
 # =============================================================================
@@ -182,60 +180,40 @@ if best_error > 0.1:
 guild_x, guild_y = best_location
 
 # =============================================================================
-# 2) 연속 캡처 스캔 루프
-#   - 매 프레임 동적 행 탐지 -> 완전히 보이는 행만 판독
-#   - 해시 dedup 으로 중복/재방문 제거
-#   - 모션/커서 가림 프레임은 exact-match 실패로 자연 필터 + CONFIRM_FRAMES 로 추가 방어
+# 2) Enter 구동 스캔
+#   - 스크롤 위치를 맞춘 뒤 [Enter] -> 현재 화면 1회 캡처/판독
+#   - 정지 화면만 캡처하므로 모션/부분프레임 걱정 없음. 부분(잘린) 행은 row_anchors 가 제외.
+#   - 해시 dedup 으로 페이지가 겹쳐도 중복 기록 안 함.
 # =============================================================================
 if not os.path.exists('nick_hash'):
     os.makedirs('nick_hash')
 
-written_records = {}     # hash -> (mission, canal, flag)  확정된 행
-pending = {}             # hash -> 연속 관측 횟수 (CONFIRM_FRAMES 도달 시 확정)
+written_records = {}     # hash -> (mission, canal, flag)
 scanned_query = 0
-last_progress = time.time()
 
-print("스크롤을 시작해 주세요. 닉네임/숫자를 커서로 가리지 않도록 주의해 주세요.")
+print("스크롤 위치를 맞춘 뒤 [Enter] 로 현재 화면을 기록하세요. 닉네임/숫자를 커서로 가리지 마세요.")
+print("모든 페이지를 다 기록했으면 [Q] 를 입력해 종료합니다.")
 while True:
-    mask = grab_mask(guild_x, guild_y)
-    seen_this_frame = set()
+    if input("[Enter]=기록 / [Q]=종료 > ").strip().upper() == 'Q':
+        break
 
+    mask = grab_mask(guild_x, guild_y)
+    new_in_frame = 0
     for anchor in row_anchors(mask):
         nick = nickname_crop(mask, anchor)
         if int(nick.sum()) <= BLANK_MIN_PIXELS:
             continue  # 빈 행
 
         h = hashlib.sha256(nick.tobytes()).hexdigest()
-        seen_this_frame.add(h)
         if h in written_records:
-            continue
+            continue  # 이미 기록된 행(재방문)
 
-        # 모션/가림 방어: 같은 해시가 CONFIRM_FRAMES 만큼 연속 관측돼야 확정
-        pending[h] = pending.get(h, 0) + 1
-        if pending[h] < CONFIRM_FRAMES:
-            continue
-
-        record = (read_mission(mask, anchor), read_canal(mask, anchor), read_flag(mask, anchor))
-        written_records[h] = record
+        written_records[h] = (read_mission(mask, anchor), read_canal(mask, anchor), read_flag(mask, anchor))
         cv2.imwrite(f'nick_hash/{h}.png', 255 - nick * 255)
+        new_in_frame += 1
 
-    # 이번 프레임에 안 보인 미확정 항목은 카운트 리셋(스크롤로 지나가버린 행)
-    for h in list(pending):
-        if h not in seen_this_frame or h in written_records:
-            pending.pop(h, None)
-
-    newly = len(written_records) - scanned_query
-    if newly > 0:
-        scanned_query = len(written_records)
-        print(f"\r{newly}명 추가, 누적 {scanned_query}명 기록")
-        last_progress = time.time()
-    elif time.time() - last_progress > IDLE_TIMEOUT:
-        print("\r시간이 초과되어 스캔을 종료합니다.", end='\n\n')
-        break
-    else:
-        print(f"\r스크롤을 넘겨주세요. {IDLE_TIMEOUT - (time.time() - last_progress):.1f}초간 새 항목이 없으면 종료합니다.", end='')
-
-    time.sleep(POLL_INTERVAL)
+    scanned_query += new_in_frame
+    print(f"  {new_in_frame}명 추가, 누적 {scanned_query}명 기록")
 # 스캔 종료
 
 
