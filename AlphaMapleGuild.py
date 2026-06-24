@@ -4,6 +4,7 @@ import numpy as np
 from openpyxl import Workbook, load_workbook
 from openpyxl.drawing.image import Image
 from PIL import ImageGrab
+import time
 import os
 import hashlib
 
@@ -74,9 +75,11 @@ CANAL_LAYOUTS = {                                # 자리수별 [(x, 배수), ..
 # 포함되므로, 다른 탭이면 매칭 오차가 올라가 창 탐색 단계에서 자동으로 걸러진다.
 
 # --- 스캔 동작 ---------------------------------------------------------------
-# Enter 구동: 사용자가 정지된 화면에서 Enter 를 누를 때만 캡처하므로
-# 연속 캡처용 파라미터(POLL/IDLE/CONFIRM)는 불필요.
-BLANK_MIN_PIXELS = 3     # 닉네임 영역 텍스트 픽셀이 이 이하이면 빈 행으로 간주
+BLANK_MIN_PIXELS = 3        # 닉네임 영역 텍스트 픽셀이 이 이하이면 빈 행으로 간주
+# 스티칭: 연속 캡처하며 데이터 밴드를 이어붙여 목록 전체를 하나의 긴 이미지로 재구성.
+STITCH_MIN_OVERLAP = 80     # 프레임 간 최소 겹침(px). 캡처보다 빠르게 스크롤하지 않으면 충분
+STITCH_MAX_MISMATCH = 0.01  # 겹침 불일치율 임계 — 초과 시 겹침 없음으로 보고 그 프레임 무시
+SCAN_IDLE_TIMEOUT = 5       # 스크롤(=캔버스 변화)이 이 시간(초) 동안 없으면 자동 종료
 
 
 # =============================================================================
@@ -96,8 +99,9 @@ def grab_mask(gx, gy):
 #   고정 그리드를 버리고, 닉네임 컬럼의 텍스트 밴드로 행 위상(phase)을 추정.
 #   pitch는 일정하므로 phase만 잡으면 모든 행을 anchor + k*pitch 로 인덱싱.
 # =============================================================================
-def row_anchors(mask):
-    """완전히 보이는 행들의 '앵커 y'(행 top = 시안 하이라이트 top 기준) 리스트 반환.
+def row_anchors(mask, top=LIST_TOP, bottom=LIST_BOTTOM):
+    """[top, bottom] 안에 '완전히' 보이는 행들의 앵커 y(행 top) 리스트 반환.
+    창 캡처엔 기본값(LIST_TOP/BOTTOM), 스티칭 캔버스엔 (0, H-1) 을 넘긴다.
     모든 오프셋(NICK_*, DIGIT_DY, 점수)은 이 행 top 기준으로 측정한다."""
     col = mask[:, DATA_X0 + NICK_X0:DATA_X0 + NICK_X1]
     present = np.where(col.sum(axis=1) > BLANK_MIN_PIXELS)[0]
@@ -112,13 +116,37 @@ def row_anchors(mask):
 
     anchors = []
     y = phase
-    while y + ROW_TEXT_H <= GUILD_H:
-        # 목록 영역 안에 '완전히' 들어오는 행만 채택 (위/아래 잘린 행 제외).
+    while y + ROW_TEXT_H <= mask.shape[0]:
+        # 경계 안에 '완전히' 들어오는 행만 채택 (위/아래 잘린 행 제외).
         # 하이라이트는 [y, y+ROW_TEXT_H-1] inclusive 이므로 bottom 픽셀에 -1.
-        if LIST_TOP <= y and (y + ROW_TEXT_H - 1) <= LIST_BOTTOM:
+        if top <= y and (y + ROW_TEXT_H - 1) <= bottom:
             anchors.append(y)
         y += ROW_PITCH
     return anchors
+
+
+def find_shift(prev_band, cur_band):
+    """cur 가 prev 대비 스크롤된 '부호 있는' 양 s(px)와 겹침 불일치율 반환.
+      s > 0 : cur 가 아래로 스크롤됨 (cur[0:H-s] == prev[s:H])
+      s < 0 : cur 가 위로 스크롤됨   (cur[-s:H] == prev[0:H+s])
+      s = 0 : 변화 없음
+    또렷한 픽셀 이동이라 정확 일치(불일치≈0)가 존재 -> 찾으면 조기 종료.
+    스크롤하는 데이터 컬럼(DATA_X0 이후)만 비교 — 사이드바 등 정적 영역 제외."""
+    H = prev_band.shape[0]
+    a = cur_band[:, DATA_X0:]
+    b = prev_band[:, DATA_X0:]
+    best_s, best = 0, 1.0
+    for d in range(0, H - STITCH_MIN_OVERLAP + 1):
+        down = float(np.mean(a[0:H - d] != b[d:H]))     # cur 가 d 아래
+        if down < best:
+            best, best_s = down, d
+        if d > 0:
+            up = float(np.mean(a[d:H] != b[0:H - d]))    # cur 가 d 위
+            if up < best:
+                best, best_s = up, -d
+        if best < 0.001:        # 또렷한 정확 일치 발견 -> 조기 종료
+            break
+    return best_s, best
 
 
 # =============================================================================
@@ -180,40 +208,66 @@ if best_error > 0.1:
 guild_x, guild_y = best_location
 
 # =============================================================================
-# 2) Enter 구동 스캔
-#   - 스크롤 위치를 맞춘 뒤 [Enter] -> 현재 화면 1회 캡처/판독
-#   - 정지 화면만 캡처하므로 모션/부분프레임 걱정 없음. 부분(잘린) 행은 row_anchors 가 제외.
-#   - 해시 dedup 으로 페이지가 겹쳐도 중복 기록 안 함.
+# 2) 연속 스티칭 스캔
+#   - 연속 캡처하며 데이터 밴드를 이어붙여 목록 전체를 하나의 긴 캔버스로 재구성.
+#   - 현재 프레임이 캔버스 어디에 놓이는지(cur_top) 추적 -> 위/아래 어느 방향으로 스크롤하든,
+#     이미 본 구간을 다시 지나가든 중복/누락 없이 새 부분만 위/아래로 확장.
+#   - 스크롤(=변화)이 멈추면 자동 종료. 이후 완성된 캔버스를 '한 번에' 판독.
 # =============================================================================
 if not os.path.exists('nick_hash'):
     os.makedirs('nick_hash')
 
-written_records = {}     # hash -> (mission, canal, flag)
-scanned_query = 0
+canvas = None       # 이어붙인 데이터 밴드 (full width, 행 grid 보존)
+prev = None         # 직전 프레임의 데이터 밴드
+cur_top = 0         # 현재 프레임 top 이 캔버스의 몇 번째 행에 놓이는지
+last_growth = time.time()
 
-print("스크롤 위치를 맞춘 뒤 [Enter] 로 현재 화면을 기록하세요. 닉네임/숫자를 커서로 가리지 마세요.")
-print("모든 페이지를 다 기록했으면 [Q] 를 입력해 종료합니다.")
+print("길드원 목록 위에 마우스를 두고 위/아래로 천천히 스크롤해 전체를 훑으세요.")
+print(f"닉네임/숫자를 커서로 가리지 마세요. 스크롤을 멈추면 {SCAN_IDLE_TIMEOUT}초 후 자동 종료됩니다.")
 while True:
-    if input("[Enter]=기록 / [Q]=종료 > ").strip().upper() == 'Q':
-        break
+    band = grab_mask(guild_x, guild_y)[LIST_TOP:LIST_BOTTOM + 1, :]
+    H = band.shape[0]
+    if canvas is None:
+        canvas, prev, cur_top = band.copy(), band, 0
+        last_growth = time.time()
+        continue
 
-    mask = grab_mask(guild_x, guild_y)
-    new_in_frame = 0
-    for anchor in row_anchors(mask):
-        nick = nickname_crop(mask, anchor)
+    s, mismatch = find_shift(prev, band)
+    if mismatch <= STITCH_MAX_MISMATCH and s != 0:
+        new_top = cur_top + s                       # 현재 프레임 top 의 새 캔버스 위치
+        if new_top < 0:                             # 위로 확장: 새 윗부분 prepend
+            canvas = np.vstack([band[0:-new_top, :], canvas])
+            cur_top = 0
+        elif new_top + H > canvas.shape[0]:         # 아래로 확장: 새 아랫부분 append
+            add = new_top + H - canvas.shape[0]
+            canvas = np.vstack([canvas, band[H - add:H, :]])
+            cur_top = new_top
+        else:                                       # 이미 덮인 구간(재방문) — 추가 없음
+            cur_top = new_top
+        prev = band
+        last_growth = time.time()
+        print(f"\r스캔 중... 총 높이 {canvas.shape[0]}px", end='')
+
+    if time.time() - last_growth > SCAN_IDLE_TIMEOUT:
+        print("\n스크롤이 멈춰 스캔을 종료합니다.", end='\n\n')
+        break
+# 캡처 종료 -> 캔버스 판독
+
+written_records = {}     # hash -> (mission, canal, flag)
+if canvas is not None:
+    cv2.imwrite('stitched.png', 255 - canvas * 255)   # 이어붙인 전체 목록 (확인용)
+    for anchor in row_anchors(canvas, 0, canvas.shape[0] - 1):
+        nick = nickname_crop(canvas, anchor)
         if int(nick.sum()) <= BLANK_MIN_PIXELS:
             continue  # 빈 행
-
         h = hashlib.sha256(nick.tobytes()).hexdigest()
         if h in written_records:
-            continue  # 이미 기록된 행(재방문)
-
-        written_records[h] = (read_mission(mask, anchor), read_canal(mask, anchor), read_flag(mask, anchor))
+            continue  # 만일의 중복(스티칭 오차 등)
+        written_records[h] = (read_mission(canvas, anchor), read_canal(canvas, anchor), read_flag(canvas, anchor))
         cv2.imwrite(f'nick_hash/{h}.png', 255 - nick * 255)
-        new_in_frame += 1
 
-    scanned_query += new_in_frame
-    print(f"  {new_in_frame}명 추가, 누적 {scanned_query}명 기록")
+scanned_query = len(written_records)
+print(f"\n총 {scanned_query}명 인식 (이어붙인 이미지는 stitched.png 에 저장)")
 # 스캔 종료
 
 
